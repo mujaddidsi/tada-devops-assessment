@@ -1,0 +1,106 @@
+# =============================================================
+# Karpenter NodePool + EC2NodeClass
+# Purpose: Automatically provision EC2 nodes during traffic burst
+# Strategy: 70% Spot (cost saving) + 30% On-Demand (stability)
+# Instance choice: c6i/c6a (compute-optimized) for CPU-heavy
+#                  payment processing workloads
+# =============================================================
+
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: payment-burst-pool
+spec:
+  template:
+    metadata:
+      labels:
+        workload-type: payment
+    spec:
+      nodeClassRef:
+        name: payment-node-class
+      requirements:
+        # Prefer compute-optimized instances for payment workloads
+        # c6i/c6a: best price/performance for CPU-bound processing
+        # m6i: general-purpose fallback if compute-optimized unavailable
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["c6i", "c6a", "m6i"]
+
+        # Allow multiple sizes for flexible bin-packing
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["2xlarge", "4xlarge", "8xlarge"]
+
+        # Mix Spot + On-Demand:
+        # Spot handles burst (cheaper, ~70% discount)
+        # On-Demand handles baseline (stable, guaranteed)
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+
+        # Spread nodes across all 3 AZs for high availability
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["ap-southeast-1a", "ap-southeast-1b", "ap-southeast-1c"]
+
+      # Taint: only payment pods (with matching toleration) can use these nodes
+      # Prevents other workloads (e.g. monitoring) from consuming payment capacity
+      taints:
+        - key: workload
+          value: payment
+          effect: NoSchedule
+
+  # Hard limit: maximum total resources Karpenter can provision
+  # Acts as a cost guardrail — prevents runaway scaling
+  limits:
+    cpu: "10000"
+    memory: "40000Gi"
+
+  disruption:
+    # Remove underutilized nodes to reduce cost after spike
+    consolidationPolicy: WhenUnderutilized
+    # Wait 30 min before consolidating — avoid flapping during fluctuating traffic
+    consolidateAfter: 30m
+    expireAfter: 720h
+
+---
+# EC2NodeClass: defines the technical details of the EC2 instances
+# Referenced by NodePool above via nodeClassRef
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: payment-node-class
+spec:
+  amiFamily: AL2
+
+  # IAM role that Karpenter uses to launch instances
+  role: KarpenterNodeRole-payment-cluster
+
+  # Only launch nodes in private subnets (no direct internet access)
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: payment-cluster
+        tier: private
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: payment-cluster
+
+  # Root volume configuration
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeType: gp3        # Faster than gp2, better price/performance
+        volumeSize: 100Gi
+        throughput: 500        # MB/s
+        iops: 4000
+        encrypted: true        # Encrypt at rest — required for payment data
+
+  # Bootstrap script: runs when each new node first starts
+  userData: |
+    #!/bin/bash
+    # Increase kernel connection limits for high-throughput payment traffic
+    # Default somaxconn is 128 — far too low for 1M TPS
+    sysctl -w net.core.somaxconn=65535
+    sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535"

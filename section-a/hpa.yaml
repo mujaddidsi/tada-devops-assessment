@@ -1,0 +1,98 @@
+# =============================================================
+# HorizontalPodAutoscaler (HPA)
+# Purpose: Automatically scale the number of payment pods
+#          based on traffic load and queue depth
+#
+# Metrics used:
+#   1. requests_per_second — direct traffic pressure per pod
+#   2. sqs_queue_depth     — backlog pressure from message queue
+#   3. cpu                 — compute utilization as fallback
+#
+# Scale-up  is AGGRESSIVE — traffic can spike within seconds
+# Scale-down is CONSERVATIVE — avoid dropping in-flight transactions
+# =============================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-service-hpa
+  namespace: payments
+spec:
+  # Target deployment to scale
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+
+  # Minimum replicas: pre-warmed baseline, never scale below this
+  # Even at 1 TPS we keep 10 pods ready to absorb sudden burst
+  minReplicas: 10
+  maxReplicas: 5000
+
+  metrics:
+    # Metric 1: requests per second per pod
+    # Target: each pod handles max 200 RPS
+    # If avg RPS/pod exceeds 200 → scale up
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "200"
+
+    # Metric 2: SQS queue depth
+    # Target: max 50 messages waiting per pod
+    # If queue grows beyond 50/pod → scale up consumers
+    - type: External
+      external:
+        metric:
+          name: sqs_queue_depth
+          selector:
+            matchLabels:
+              queue: payment-ingest
+        target:
+          type: AverageValue
+          averageValue: "50"
+
+    # Metric 3: CPU utilization
+    # Target: keep CPU at 60% — leave headroom for traffic spikes
+    # Conservative threshold avoids CPU saturation during burst
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+  behavior:
+    scaleUp:
+      # stabilizationWindowSeconds: 0 means scale up IMMEDIATELY
+      # No waiting — every second counts during a viral traffic spike
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        # Policy 1: allow up to 500% increase per 15 seconds
+        # Example: 100 pods → can jump to 500 pods in one step
+        - type: Percent
+          value: 500
+          periodSeconds: 15
+
+        # Policy 2: OR add up to 200 pods flat per 15 seconds
+        # Whichever is larger (Max) will be used
+        - type: Pods
+          value: 200
+          periodSeconds: 15
+
+    scaleDown:
+      # Wait 5 minutes before scaling down
+      # Reason: traffic may still be fluctuating after spike
+      # Scaling down too early risks dropping in-flight payments
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        # Remove at most 10% of pods per 60 seconds
+        # Gradual reduction ensures graceful transaction completion
+        - type: Percent
+          value: 10
+          periodSeconds: 60

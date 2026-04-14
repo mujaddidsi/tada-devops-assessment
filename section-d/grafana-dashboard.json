@@ -1,0 +1,202 @@
+{
+  "title": "Payment Platform — 1M TPS Event Dashboard",
+  "description": "Real-time monitoring dashboard for payment platform during viral traffic spike",
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Real-Time TPS",
+      "description": "Current transactions per second — alert threshold at 500K and 900K",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(transaction_rate:5m)",
+          "legendFormat": "Current TPS"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "thresholds": {
+        "steps": [
+          { "value": 0,      "color": "green"  },
+          { "value": 500000, "color": "yellow" },
+          { "value": 900000, "color": "red"    }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "title": "Error Rate (%)",
+      "description": "Percentage of failed transactions — SLO threshold at 0.1%",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(transaction_error_rate:5m) * 100",
+          "legendFormat": "Error Rate %"
+        }
+      ],
+      "thresholds": {
+        "steps": [
+          { "value": 0,   "color": "green"  },
+          { "value": 0.1, "color": "yellow" },
+          { "value": 1.0, "color": "red"    }
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "title": "HPA Replica Count",
+      "description": "Current number of payment service pods",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace='payments', horizontalpodautoscaler='payment-service-hpa'}",
+          "legendFormat": "Current Replicas"
+        }
+      ],
+      "thresholds": {
+        "steps": [
+          { "value": 0,    "color": "red"    },
+          { "value": 10,   "color": "yellow" },
+          { "value": 100,  "color": "green"  }
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "title": "SLO Error Budget Remaining",
+      "description": "How much error budget is left this month — SLO 99.9%",
+      "type": "gauge",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "1 - (sum(transaction_error_rate:5m) / 0.001)",
+          "legendFormat": "Budget Remaining"
+        }
+      ],
+      "options": {
+        "minValue": 0,
+        "maxValue": 1
+      },
+      "thresholds": {
+        "steps": [
+          { "value": 0,   "color": "red"    },
+          { "value": 0.5, "color": "yellow" },
+          { "value": 0.8, "color": "green"  }
+        ]
+      }
+    },
+    {
+      "id": 5,
+      "title": "Latency Percentiles (p50 / p95 / p99)",
+      "description": "Request latency distribution — p99 alert at 500ms",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "payment_latency_p50:5m * 1000",
+          "legendFormat": "p50 latency (ms)"
+        },
+        {
+          "expr": "payment_latency_p95:5m * 1000",
+          "legendFormat": "p95 latency (ms)"
+        },
+        {
+          "expr": "payment_latency_p99:5m * 1000",
+          "legendFormat": "p99 latency (ms)"
+        }
+      ],
+      "thresholds": [
+        { "value": 500, "color": "red", "line": true }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Error Rate by Service",
+      "description": "Error rate breakdown per microservice",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(payment_requests_total{status=~'5..'}[5m]) by (service)",
+          "legendFormat": "{{ service }}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Kinesis Consumer Lag (ms)",
+      "description": "How far behind consumers are from the stream — alert at 30s",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "aws_kinesis_get_records_iterator_age_milliseconds_maximum",
+          "legendFormat": "Consumer Lag"
+        }
+      ],
+      "thresholds": [
+        { "value": 30000, "color": "red", "line": true }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "DynamoDB WCU Consumed",
+      "description": "Write capacity units consumed vs provisioned limit of 1.2M",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "aws_dynamodb_consumed_write_capacity_units_sum",
+          "legendFormat": "WCU Consumed"
+        },
+        {
+          "expr": "1200000",
+          "legendFormat": "Provisioned Limit"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Node CPU Utilization",
+      "description": "CPU usage per node — detect hotspot nodes",
+      "type": "heatmap",
+      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "avg by (node) (rate(node_cpu_seconds_total{mode!='idle'}[2m])) * 100",
+          "legendFormat": "{{ node }}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "SQS Queue Depth",
+      "description": "Messages waiting in payment queue — backpressure indicator",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "aws_sqs_approximate_number_of_messages_visible_maximum{queue_name='payment-ingest'}",
+          "legendFormat": "Queue Depth"
+        },
+        {
+          "expr": "aws_sqs_approximate_number_of_messages_visible_maximum{queue_name='payment-ingest-dlq'}",
+          "legendFormat": "DLQ Depth"
+        }
+      ],
+      "thresholds": [
+        { "value": 10000, "color": "red", "line": true }
+      ]
+    }
+  ]
+}

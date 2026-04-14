@@ -1,0 +1,60 @@
+# =============================================================
+# VerticalPodAutoscaler (VPA)
+# Purpose: Analyze and recommend optimal CPU/memory settings
+#          for payment service pods
+#
+# Mode: "Off" — recommendation only, never mutates live pods
+#
+# Why "Off" mode?
+# VPA in "Auto" mode restarts pods to apply new resource values.
+# For a payment service, unexpected pod restarts can drop
+# in-flight transactions — unacceptable for production.
+#
+# How we use VPA recommendations:
+# 1. VPA observes pod resource usage over time
+# 2. VPA generates recommended requests/limits
+# 3. We review recommendations during maintenance windows
+# 4. We manually apply them to the Deployment manifest
+# 5. HPA then uses accurate baselines for scaling decisions
+#
+# VPA + HPA coexistence rule:
+# NEVER run VPA in Auto mode alongside HPA on CPU/memory.
+# They will conflict — VPA resizes pods, HPA rescales count,
+# causing a fight loop. Safe combination:
+#   - VPA mode: Off (recommendation only)
+#   - HPA metrics: custom metrics (RPS, queue depth), not CPU
+# =============================================================
+
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: payment-service-vpa
+  namespace: payments
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+
+  updatePolicy:
+    # "Off" = only generate recommendations, never apply automatically
+    # This prevents unexpected pod restarts during live traffic
+    updateMode: "Off"
+
+  resourcePolicy:
+    containerPolicies:
+      - containerName: payment-service
+
+        # Minimum resource floor — pod must have at least this much
+        minAllowed:
+          cpu: 500m       # 0.5 CPU core minimum
+          memory: 512Mi   # 512 MB minimum
+
+        # Maximum resource ceiling — VPA won't recommend above this
+        maxAllowed:
+          cpu: 4          # 4 CPU cores maximum per pod
+          memory: 8Gi     # 8 GB maximum per pod
+
+        # Only tune requests, not limits
+        # Limits stay fixed to prevent noisy neighbor problems
+        controlledValues: RequestsOnly

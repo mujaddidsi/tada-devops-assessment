@@ -1,0 +1,144 @@
+# =============================================================
+# Kyverno Security Policies
+# Purpose: Enforce security best practices for all pods
+#          in the payments namespace automatically
+#
+# What is Kyverno?
+# Policy engine for Kubernetes
+# Intercepts every pod creation request
+# Validates against security rules BEFORE pod is created
+# If rules violated → pod creation REJECTED automatically
+#
+# Policies enforced:
+# 1. No privileged containers
+# 2. Resource limits required
+# 3. Run as non-root
+# 4. Read-only root filesystem
+# 5. Signed ECR images only
+# =============================================================
+
+# ── Policy 1: No Privileged Containers ──────────────────────
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: no-privileged-containers
+spec:
+  # Enforce: reject pods that violate this policy
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-privileged
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [payments]
+      validate:
+        message: >
+          Privileged containers are not allowed in payments namespace.
+          Remove securityContext.privileged or set it to false.
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): false
+
+---
+# ── Policy 2: Require Resource Requests and Limits ──────────
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-resource-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [payments]
+      validate:
+        message: >
+          Resource requests and limits are required for all containers.
+          Add resources.requests and resources.limits to your container spec.
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    # Must specify CPU request
+                    cpu: "?*"
+                    # Must specify memory request
+                    memory: "?*"
+                  limits:
+                    # Must specify CPU limit
+                    cpu: "?*"
+                    # Must specify memory limit
+                    memory: "?*"
+
+---
+# ── Policy 3: Run as Non-Root ────────────────────────────────
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: run-as-non-root
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-non-root
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [payments]
+      validate:
+        message: >
+          Containers must run as non-root user.
+          Set securityContext.runAsNonRoot: true
+          and securityContext.readOnlyRootFilesystem: true
+        pattern:
+          spec:
+            # Pod-level security context
+            securityContext:
+              runAsNonRoot: true
+            containers:
+              # Container-level security context
+              - securityContext:
+                  runAsNonRoot: true
+                  # Prevent privilege escalation
+                  allowPrivilegeEscalation: false
+                  # Root filesystem is read-only
+                  # Prevents malware from writing to container
+                  readOnlyRootFilesystem: true
+
+---
+# ── Policy 4: Signed ECR Images Only ────────────────────────
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-signed-images
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: verify-ecr-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [payments]
+      # Verify image signature before allowing pod creation
+      verifyImages:
+        - imageReferences:
+            # Only allow images from our ECR registry
+            - "123456789.dkr.ecr.ap-southeast-1.amazonaws.com/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # Images must be signed by our GitHub Actions pipeline
+                    subject: "https://github.com/tada/payment-service/*"
+                    issuer: "https://token.actions.githubusercontent.com"

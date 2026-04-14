@@ -1,0 +1,98 @@
+# =============================================================
+# Istio DestinationRule
+# Purpose: Define HOW traffic is sent to payment service pods
+#
+# Three main configurations:
+#   1. Connection pool — limit max connections per pod
+#   2. Circuit breaker — stop sending to unhealthy pods
+#   3. Load balancing — choose which pod gets the request
+#
+# What is a Circuit Breaker?
+# Like an electrical circuit breaker at home —
+# if something goes wrong (too many errors),
+# it "trips" and stops sending traffic to that pod
+# giving it time to recover before trying again.
+# =============================================================
+
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: payment-service-dr
+  namespace: payments
+spec:
+  host: payment-service
+
+  trafficPolicy:
+    # ── Connection Pool ───────────────────────────────────────
+    # Limits how many connections can be made to each pod
+    # Prevents any single pod from being overwhelmed
+    connectionPool:
+      tcp:
+        # Maximum concurrent TCP connections per pod
+        maxConnections: 10000
+        # How long to wait when establishing a connection
+        connectTimeout: 3s
+
+      http:
+        # Maximum concurrent HTTP/2 requests per pod
+        http2MaxRequests: 50000
+        # Maximum queued requests when pod is at capacity
+        http1MaxPendingRequests: 5000
+        # Maximum retries across all pods at any given time
+        maxRetries: 3
+
+    # ── Circuit Breaker (Outlier Detection) ───────────────────
+    # Automatically ejects pods that are returning errors
+    # Think of it as "temporary ban" for misbehaving pods
+    outlierDetection:
+      # How many consecutive 5xx errors before ejecting pod
+      # Pod returns 5 errors in a row → ejected from pool
+      consecutive5xxErrors: 5
+
+      # How often Istio scans for misbehaving pods
+      interval: 10s
+
+      # How long ejected pod stays out of rotation
+      # Starts at 30s, doubles each time pod is ejected again
+      baseEjectionTime: 30s
+
+      # Maximum percentage of pods that can be ejected at once
+      # 50% = never eject more than half the pod pool
+      # Ensures system keeps running even during failures
+      maxEjectionPercent: 50
+
+      # Minimum healthy pods required before ejection kicks in
+      # If less than 50% pods are healthy → stop ejecting
+      # Prevents ejecting all pods during widespread failure
+      minHealthPercent: 50
+
+    # ── Load Balancing ────────────────────────────────────────
+    # LEAST_REQUEST = send to pod with fewest active requests
+    # Better than ROUND_ROBIN for payment workloads because:
+    # Payment requests have variable processing time
+    # LEAST_REQUEST naturally avoids overloading slow pods
+    loadBalancer:
+      simple: LEAST_REQUEST
+
+  # ── Subsets ───────────────────────────────────────────────
+  # Define stable and canary versions
+  # Referenced by VirtualService for canary routing
+  subsets:
+    # Stable subset: production-ready version
+    # Gets 95% of traffic from VirtualService
+    - name: stable
+      labels:
+        version: stable
+
+    # Canary subset: new version being tested
+    # Gets 5% of traffic from VirtualService
+    # Has stricter connection limit — protect system if canary misbehaves
+    - name: canary
+      labels:
+        version: canary
+      trafficPolicy:
+        connectionPool:
+          http:
+            # Limit canary to 1000 requests max
+            # If canary has bugs, damage is contained to 1000 req
+            http2MaxRequests: 1000

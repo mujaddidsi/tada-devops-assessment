@@ -1,0 +1,35 @@
+# =============================================================
+# Istio PeerAuthentication
+# Purpose: Enforce mTLS (mutual TLS) for all pod-to-pod
+#          communication in the payments namespace
+#
+# What is mTLS?
+# Normal TLS: only SERVER proves its identity to client
+#             (like HTTPS websites)
+# Mutual TLS: BOTH sides prove their identity to each other
+#             Server proves to client AND client proves to server
+#
+# Why mTLS for payment service?
+# Without mTLS: any pod in the cluster can talk to payment pods
+#              — even compromised or malicious pods
+# With mTLS:   only pods with valid certificates can communicate
+#              — rogue pods are rejected automatically
+#
+# Istio handles mTLS automatically:
+# No code changes needed in the application
+# Istio sidecar (Envoy) handles all certificate management
+# Certificates rotate automatically every 24 hours
+# =============================================================
+
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: payment-mtls
+  # Apply to entire payments namespace
+  namespace: payments
+spec:
+  mtls:
+    # STRICT mode: ALL traffic must use mTLS
+    # Any non-mTLS request will be REJECTED
+    # This is the most secure setting
+    mode: STRICT

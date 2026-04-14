@@ -1,0 +1,139 @@
+# =============================================================
+# OpenTelemetry Collector
+# Purpose: Collect, process, and export telemetry data
+#          (metrics, traces, logs) from all payment pods
+#
+# What is OpenTelemetry?
+# Open standard for collecting observability data
+# Works with any backend: Jaeger, Prometheus, Loki, etc.
+#
+# Deployed as DaemonSet:
+# One collector per node — collects from all pods on that node
+# Reduces network hops — data stays on same node
+#
+# Pipeline:
+# App → OTel Collector → Jaeger (traces)
+#                      → Prometheus (metrics)
+#                      → Loki (logs)
+#
+# Adaptive sampling:
+# Normal traffic  : sample 1% of traces (cost saving)
+# Anomaly detected: sample 100% of traces (full visibility)
+# =============================================================
+
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-collector
+  namespace: monitoring
+spec:
+  # DaemonSet: one collector per node
+  mode: DaemonSet
+
+  config: |
+    # ── Receivers ───────────────────────────────────────────
+    # How OTel Collector receives data from applications
+    receivers:
+      # OTLP: standard OpenTelemetry protocol
+      # Apps send traces, metrics, logs here
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317   # gRPC port
+          http:
+            endpoint: 0.0.0.0:4318   # HTTP port
+
+      # Prometheus: scrape metrics from pods
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'payment-pods'
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                  action: keep
+                  regex: true
+
+    # ── Processors ──────────────────────────────────────────
+    # Transform and filter data before exporting
+    processors:
+      # Batch: group data before sending to reduce network calls
+      batch:
+        timeout: 1s
+        send_batch_size: 1000
+
+      # Tail sampling: decide which traces to keep AFTER seeing
+      # the full trace — smarter than head-based sampling
+      tail_sampling:
+        # Wait 10s for all spans before making sampling decision
+        decision_wait: 10s
+        policies:
+          # Always keep traces with errors
+          - name: error-sampling
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+
+          # Always keep slow traces (p99 > 500ms)
+          - name: latency-sampling
+            type: latency
+            latency:
+              threshold_ms: 500
+
+          # Keep only 1% of normal healthy traces
+          # Saves storage cost at 1M TPS
+          - name: probabilistic-normal
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 1
+
+      # Memory limiter: prevent OTel collector from OOMing
+      memory_limiter:
+        limit_mib: 512
+        spike_limit_mib: 128
+        check_interval: 5s
+
+    # ── Exporters ────────────────────────────────────────────
+    # Where to send the collected data
+    exporters:
+      # Traces → Jaeger
+      jaeger:
+        endpoint: jaeger-collector:14250
+        tls:
+          insecure: true
+
+      # Metrics → Prometheus
+      prometheus:
+        endpoint: 0.0.0.0:8889
+
+      # Logs → Loki
+      loki:
+        endpoint: http://loki:3100/loki/api/v1/push
+        labels:
+          resource:
+            service.name: "service_name"
+            k8s.namespace.name: "namespace"
+            k8s.pod.name: "pod"
+
+    # ── Service Pipelines ────────────────────────────────────
+    # Connect receivers → processors → exporters
+    service:
+      pipelines:
+        # Traces pipeline
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, tail_sampling, batch]
+          exporters: [jaeger]
+
+        # Metrics pipeline
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus]
+
+        # Logs pipeline
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [loki]

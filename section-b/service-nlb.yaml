@@ -1,0 +1,62 @@
+# =============================================================
+# Kubernetes Service with NLB (Network Load Balancer) Annotations
+# Purpose: Expose payment service to internet via AWS NLB
+#
+# Why NLB and not ALB?
+# NLB operates at Layer 4 (TCP/UDP) — much faster than ALB (Layer 7)
+# NLB can handle millions of connections per second
+# NLB has static IPs per AZ — important for IP whitelisting
+# ALB is better for HTTP routing — we handle that in NGINX/Istio
+#
+# Request flow:
+# Client → NLB → NGINX Ingress → Istio Sidecar → Payment Pod
+# =============================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: payments
+  annotations:
+    # Use external NLB (internet-facing)
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+
+    # Target pods directly by IP — faster than targeting nodes
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+
+    # Internet-facing — accessible from outside VPC
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+    # Distribute traffic across all AZs evenly
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+    # Proxy Protocol v2: preserves original client IP address
+    # Without this, payment service only sees NLB IP, not real client IP
+    service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+
+    # Connection draining: wait 30s before removing pod from LB
+    # Allows in-flight payment requests to complete before pod removed
+    service.beta.kubernetes.io/aws-load-balancer-connection-draining-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-connection-draining-timeout: "30"
+
+    # Health check configuration
+    # Check every 10s, 2 failures = unhealthy, 2 success = healthy
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-timeout: "5"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "2"
+
+spec:
+  type: LoadBalancer
+  selector:
+    app: payment-service
+
+  # Local policy: preserve client IP, avoid double network hop
+  # Traffic goes directly to pod in same AZ — reduces latency
+  externalTrafficPolicy: Local
+
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8080
+      protocol: TCP

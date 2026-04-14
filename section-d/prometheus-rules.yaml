@@ -1,0 +1,145 @@
+# =============================================================
+# Prometheus Recording Rules + Alerting Rules
+# Purpose: Pre-compute expensive metrics and alert on SLO breach
+#
+# Two types of rules:
+# 1. Recording rules — pre-compute heavy queries for fast dashboards
+# 2. Alerting rules  — fire alerts when thresholds are breached
+#
+# SLO (Service Level Objective):
+# We target 99.9% availability = max 43 minutes downtime per month
+# Multi-window burn rate alerts detect budget exhaustion early
+# =============================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payment-slo-rules
+  namespace: monitoring
+spec:
+  groups:
+    # ── Recording Rules ───────────────────────────────────────
+    # Pre-compute expensive queries every 30 seconds
+    # Dashboards query these instead of raw metrics = faster
+    - name: payment.recording
+      interval: 30s
+      rules:
+        # Total transaction rate over 5 minutes
+        - record: transaction_rate:5m
+          expr: rate(payment_requests_total[5m])
+
+        # Error rate over 5 minutes
+        # = failed requests / total requests
+        - record: transaction_error_rate:5m
+          expr: |
+            rate(payment_requests_total{status=~"5.."}[5m])
+            / rate(payment_requests_total[5m])
+
+        # p99 latency over 5 minutes
+        - record: payment_latency_p99:5m
+          expr: |
+            histogram_quantile(
+              0.99,
+              rate(payment_request_duration_seconds_bucket[5m])
+            )
+
+        # p95 latency over 5 minutes
+        - record: payment_latency_p95:5m
+          expr: |
+            histogram_quantile(
+              0.95,
+              rate(payment_request_duration_seconds_bucket[5m])
+            )
+
+        # p50 latency over 5 minutes
+        - record: payment_latency_p50:5m
+          expr: |
+            histogram_quantile(
+              0.50,
+              rate(payment_request_duration_seconds_bucket[5m])
+            )
+
+    # ── Alerting Rules ────────────────────────────────────────
+    - name: payment.slo.alerts
+      rules:
+        # Alert 1: Fast burn rate (critical)
+        # If error budget burns 14.4x faster than normal
+        # → will exhaust monthly budget in less than 1 hour
+        # → page on-call engineer IMMEDIATELY
+        - alert: PaymentSLOFastBurn
+          expr: |
+            (
+              transaction_error_rate:5m > (14.4 * 0.001)
+              and
+              rate(payment_requests_total{status=~"5.."}[1h])
+                / rate(payment_requests_total[1h]) > (14.4 * 0.001)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            team: payments
+          annotations:
+            summary: "Payment SLO fast burn — page immediately"
+            description: >
+              Error budget burning at 14.4x rate.
+              Will exhaust monthly budget in less than 1 hour.
+              Current error rate: {{ $value | humanizePercentage }}
+
+        # Alert 2: Slow burn rate (warning)
+        # If error budget burns 6x faster than normal
+        # → will exhaust monthly budget in less than 6 hours
+        # → notify Slack, investigate but not urgent page
+        - alert: PaymentSLOSlowBurn
+          expr: |
+            (
+              transaction_error_rate:5m > (6 * 0.001)
+              and
+              rate(payment_requests_total{status=~"5.."}[6h])
+                / rate(payment_requests_total[6h]) > (6 * 0.001)
+            )
+          for: 15m
+          labels:
+            severity: warning
+            team: payments
+          annotations:
+            summary: "Payment SLO slow burn — investigate"
+            description: >
+              Error budget burning at 6x rate.
+              Will exhaust monthly budget in less than 6 hours.
+
+        # Alert 3: TPS surge detected
+        # Traffic exceeding 500K TPS — spike event starting
+        - alert: TPSSurgeDetected
+          expr: sum(transaction_rate:5m) > 500000
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: "TPS surge detected: {{ $value | humanize }} TPS"
+            description: "Traffic spike detected. Monitor scaling behavior."
+
+        # Alert 4: High p99 latency
+        # p99 latency above 500ms — payment processing too slow
+        - alert: PaymentHighLatency
+          expr: payment_latency_p99:5m > 0.5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Payment p99 latency above 500ms"
+            description: >
+              Current p99 latency: {{ $value | humanizeDuration }}
+
+        # Alert 5: Kinesis consumer lag
+        # Consumer falling more than 60 seconds behind stream
+        - alert: KinesisConsumerLag
+          expr: |
+            aws_kinesis_get_records_iterator_age_milliseconds_maximum > 60000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kinesis consumer falling behind"
+            description: >
+              Consumer lag: {{ $value | humanizeDuration }}
+              Transactions may be delayed.

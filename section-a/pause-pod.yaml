@@ -1,0 +1,93 @@
+# =============================================================
+# Pause Pod + Low Priority PriorityClass
+# Purpose: Pre-warm node capacity to eliminate cold-start delay
+#          during sudden traffic bursts
+#
+# Problem it solves:
+# When traffic spikes, HPA requests new pods immediately.
+# But if no node has free capacity, Karpenter must provision
+# a new EC2 instance — this takes ~60-90 seconds.
+# During those 90 seconds, payment requests are queued or dropped.
+#
+# Solution — Pause pods:
+# Keep "placeholder" pods running on nodes at all times.
+# These pods have the LOWEST possible priority (-1).
+# When a real payment pod needs scheduling:
+#   1. Scheduler evicts pause pod (lowest priority first)
+#   2. Payment pod takes its spot IMMEDIATELY (0 second delay)
+#   3. Karpenter provisions a new node for the evicted pause pod
+#   4. New node is ready for the NEXT burst wave
+#
+# Eviction mechanics:
+# Kubernetes scheduler uses PriorityClass to decide eviction order.
+# Pause pods (priority: -1) are always evicted before any real pod
+# (priority: 0 or higher). This is guaranteed by the scheduler.
+# =============================================================
+
+# Step 1: Define a low priority class for pause pods
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: overprovisioning-low-priority
+# Negative value = lower than any real workload (default is 0)
+# This guarantees pause pods are always evicted first
+value: -1
+globalDefault: false
+description: "Pause pods that hold capacity and are evicted when real workloads need space"
+# preemptionPolicy: Never means pause pods will NOT evict other pods
+# They can only BE evicted, never evict others
+preemptionPolicy: Never
+
+---
+# Step 2: Deploy pause pods to hold capacity on nodes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capacity-pause
+  namespace: kube-system
+spec:
+  # 20 pause pods = reserves roughly 4 nodes worth of capacity
+  # Adjust based on expected burst size
+  replicas: 20
+  selector:
+    matchLabels:
+      app: capacity-pause
+  template:
+    metadata:
+      labels:
+        app: capacity-pause
+    spec:
+      # Assign the low priority class defined above
+      priorityClassName: overprovisioning-low-priority
+
+      # No grace period needed — pause pods hold no real state
+      terminationGracePeriodSeconds: 0
+
+      containers:
+        - name: pause
+          # Official Kubernetes pause image — does absolutely nothing
+          # Uses near-zero CPU and memory at runtime
+          image: k8s.gcr.io/pause:3.9
+          resources:
+            requests:
+              cpu: "1"        # Requests 1 CPU — reserves space on node
+              memory: "2Gi"   # Requests 2GB — reserves memory on node
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+
+      # Spread pause pods across all AZs
+      # So every AZ has pre-warmed capacity ready
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: capacity-pause
+
+      # Allow pause pods on payment nodes
+      tolerations:
+        - key: workload
+          value: payment
+          effect: NoSchedule

@@ -1,0 +1,69 @@
+# =============================================================
+# KEDA ScaledObject
+# Purpose: Scale payment consumer pods based on queue pressure
+#
+# Why KEDA and not just HPA?
+# HPA can only scale based on CPU/memory or basic metrics.
+# KEDA can scale based on EXTERNAL sources like SQS and Kinesis
+# directly — no need for custom metric adapters.
+#
+# Triggers used:
+#   1. SQS queue depth   — how many messages are waiting
+#   2. Kinesis iterator age — how far behind the consumer is
+# =============================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: payment-consumer-scaler
+  namespace: payments
+spec:
+  # Target deployment to scale
+  scaleTargetRef:
+    name: payment-consumer
+
+  # Minimum pods when queue is empty
+  minReplicaCount: 5
+  # Maximum pods allowed
+  maxReplicaCount: 3000
+  # How often KEDA checks the triggers (every 5 seconds)
+  pollingInterval: 5
+  # How long to wait before scaling down to zero
+  cooldownPeriod: 120
+
+  triggers:
+    # Trigger 1: SQS Queue Depth
+    # Scale up when messages pile up in the queue
+    # Target: each pod processes max 30 messages at a time
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: https://sqs.ap-southeast-1.amazonaws.com/123456789/payment-ingest
+        queueLength: "30"
+        awsRegion: ap-southeast-1
+        # Use IRSA (IAM Role for Service Account) — no hardcoded credentials
+        identityOwner: operator
+        # Count in-flight messages too, not just visible ones
+        scaleOnInFlight: "true"
+
+    # Trigger 2: Kinesis Shard Iterator Age
+    # Scale up when consumer is falling behind the stream
+    # If consumer is more than 30 seconds behind → scale up
+    - type: aws-kinesis-stream
+      metadata:
+        streamName: payment-events
+        shardCount: "1000"
+        awsRegion: ap-southeast-1
+        # How far behind (in ms) before scaling kicks in
+        shardIteratorAge: "30000"
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          # Scale up immediately — no stabilization window
+          stabilizationWindowSeconds: 0
+          policies:
+            # Allow tripling pod count every 10 seconds during burst
+            - type: Percent
+              value: 300
+              periodSeconds: 10

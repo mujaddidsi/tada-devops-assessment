@@ -1,0 +1,65 @@
+# =============================================================
+# Istio VirtualService
+# Purpose: Control HOW traffic is routed to payment service
+#
+# Two routing scenarios:
+#   1. Canary deployment — split traffic 95% stable / 5% canary
+#      Allows safe testing of new version during spike event
+#
+#   2. Header-based routing — force specific clients to canary
+#      Example: internal testers use x-canary: true header
+#
+# Why canary during a spike event?
+# Even at 1M TPS we may need to deploy hotfixes.
+# Canary lets us test fixes on 5% traffic before full rollout.
+# If canary fails → circuit breaker stops it automatically.
+# =============================================================
+
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: payment-service-vs
+  namespace: payments
+spec:
+  hosts:
+    - payment-service
+
+  http:
+    # Route 1: Force canary for internal testers
+    # If request has header x-canary: true → always go to canary
+    # Used by QA team to test new version without affecting users
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: payment-service
+            subset: canary
+          weight: 100
+
+    # Route 2: Normal traffic split
+    # 95% goes to stable version (safe, proven)
+    # 5% goes to canary version (new, being tested)
+    - route:
+        - destination:
+            host: payment-service
+            subset: stable
+          weight: 95
+        - destination:
+            host: payment-service
+            subset: canary
+          weight: 5
+
+      # Retry policy: if request fails, try again automatically
+      # attempts: 3 = try up to 3 times total
+      # perTryTimeout: 2s = each attempt must respond within 2s
+      # retryOn: only retry on these specific error types
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: "gateway-error,connect-failure,retriable-4xx"
+
+      # Overall timeout: entire request must complete within 10s
+      # Including all retries — after 10s return error to client
+      timeout: 10s
