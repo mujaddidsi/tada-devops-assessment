@@ -1,0 +1,93 @@
+# =============================================================
+# PodTopologySpreadConstraints
+# Purpose: Ensure payment pods are evenly distributed across
+#          Availability Zones during rapid scale-up
+#
+# Why this matters for 1M TPS:
+# During a burst event, Karpenter provisions nodes fast.
+# Without spread constraints, the scheduler may pile all new
+# pods into a single AZ — creating a single point of failure.
+#
+# Two constraints are applied:
+#   1. Hard AZ spread   — MUST be balanced across zones
+#   2. Soft node spread — TRY to avoid hotspot nodes
+# =============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: payments
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      # ── Topology Spread Constraints ──────────────────────────
+      topologySpreadConstraints:
+
+        # Constraint 1: Hard AZ balance
+        # maxSkew: 1 means the difference between the most and
+        # least loaded AZ cannot exceed 1 pod
+        # Example with 10 pods: AZ-1a=4, AZ-1b=3, AZ-1c=3 ✅
+        #                       AZ-1a=8, AZ-1b=1, AZ-1c=1 ❌
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          # DoNotSchedule: REJECT pod if placing it would
+          # violate the maxSkew rule — hard constraint
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: payment-service
+          # Only compare pods from the same ReplicaSet
+          # Prevents old pods from affecting new pod placement
+          matchLabelKeys:
+            - pod-template-hash
+
+        # Constraint 2: Soft node spread
+        # Try to avoid putting too many pods on the same node
+        # maxSkew: 2 allows slight imbalance between nodes
+        # ScheduleAnyway: ALLOW scheduling even if it violates
+        # the rule — soft constraint, best effort only
+        - maxSkew: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: payment-service
+
+      # ── Node Affinity ────────────────────────────────────────
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # Only schedule on nodes provisioned by Karpenter
+                  # for payment workloads (matching our NodePool taint)
+                  - key: workload
+                    operator: In
+                    values: ["payment"]
+
+      # ── Toleration ───────────────────────────────────────────
+      tolerations:
+        # Allow this pod to run on nodes with payment taint
+        # Must match the taint defined in Karpenter NodePool
+        - key: workload
+          value: payment
+          effect: NoSchedule
+
+      containers:
+        - name: payment-service
+          image: payment-service:latest
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
