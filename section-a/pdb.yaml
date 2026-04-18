@@ -1,0 +1,54 @@
+# =============================================================
+# PodDisruptionBudget (PDB)
+# Purpose: Protect payment service availability during
+#          voluntary disruptions such as:
+#          - Node upgrades
+#          - Karpenter node consolidation
+#          - kubectl drain
+#          - Cluster autoscaler scale-down
+#
+# What PDB does NOT protect against:
+#          - Hardware failures (involuntary disruption)
+#          - OOMKilled pods
+#          - Node crashes
+#
+# Two PDBs defined:
+#   1. payment-service  — frontend API (minAvailable 70%)
+#   2. payment-consumer — queue consumer (maxUnavailable 1)
+# =============================================================
+
+# PDB 1: Payment Service (API layer)
+# At least 70% of pods must remain available at all times
+# Example: 100 pods running → at most 30 can be disrupted
+# Example: 10 pods running  → at most 3 can be disrupted
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+  namespace: payments
+spec:
+  # minAvailable: minimum number/percentage of pods that must stay up
+  # Using percentage (70%) so it scales with replica count automatically
+  minAvailable: "70%"
+  selector:
+    matchLabels:
+      app: payment-service
+      tier: critical
+
+---
+# PDB 2: Payment Consumer (queue processing layer)
+# Only 1 consumer pod can be down at a time
+# Reason: consumers hold in-flight messages from SQS/Kinesis
+# Losing too many consumers = messages pile up in queue
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-consumer-pdb
+  namespace: payments
+spec:
+  # maxUnavailable: maximum pods that can be disrupted at once
+  # Using absolute number (1) for strict control
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: payment-consumer
