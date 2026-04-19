@@ -1,0 +1,96 @@
+# =============================================================
+# Backpressure Implementation
+# Purpose: Prevent system overload when downstream services
+#          are saturated or too slow to keep up
+#
+# What is backpressure?
+# When a consumer cannot keep up with incoming traffic,
+# backpressure signals upstream to slow down or stop sending
+# This prevents cascading failures across the entire system
+#
+# Implementation:
+# 1. Readiness probe — pod signals it is too busy via /ready
+# 2. Kubernetes removes busy pod from load balancer
+# 3. No new traffic sent to overloaded pod
+# 4. Pod finishes current work before accepting new requests
+#
+# Analogy:
+# Like a restaurant that puts up "FULL" sign at the door
+# New customers are redirected to other tables
+# Not turned away — just sent somewhere that can serve them
+# =============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-consumer
+  namespace: payments
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: payment-consumer
+  template:
+    metadata:
+      labels:
+        app: payment-consumer
+    spec:
+      containers:
+        - name: payment-consumer
+          image: payment-consumer:latest
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          # ── Readiness Probe ─────────────────────────────────
+          # Kubernetes checks /ready every 5 seconds
+          # If /ready returns 503 → remove pod from load balancer
+          # If /ready returns 200 → pod is healthy, send traffic
+          #
+          # Our /ready endpoint checks:
+          # - SQS queue depth per pod
+          # - If queue depth > 10,000 → return 503 (too busy)
+          # - If queue depth < 10,000 → return 200 (ready)
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            # Start checking after 5 seconds
+            initialDelaySeconds: 5
+            # Check every 5 seconds
+            periodSeconds: 5
+            # 2 consecutive failures = not ready
+            failureThreshold: 2
+            # 1 success = ready again
+            successThreshold: 1
+
+          # ── Liveness Probe ──────────────────────────────────
+          # Checks if pod is still alive (not deadlocked/frozen)
+          # If liveness fails → Kubernetes RESTARTS the pod
+          # Different from readiness: readiness = busy, liveness = dead
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # ── Lifecycle Hook ──────────────────────────────────
+          # Before pod is terminated:
+          # 1. Sleep 15 seconds — gives time for load balancer
+          #    to stop sending new traffic to this pod
+          # 2. Pod finishes processing current messages
+          # 3. Pod exits cleanly — no messages lost
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 15"]
+
+      # Give pod 60 seconds to finish in-flight transactions
+      # before force-killing it
+      terminationGracePeriodSeconds: 60
