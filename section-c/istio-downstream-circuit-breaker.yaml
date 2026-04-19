@@ -1,0 +1,145 @@
+# =============================================================
+# Istio Circuit Breaker for Downstream Calls
+# Purpose: Protect payment consumer pods when downstream
+#          services (DynamoDB, Aurora, Redis) are saturated
+#
+# Different from Section B circuit breaker:
+# Section B = circuit breaker for INCOMING traffic to payment API
+# This file = circuit breaker for OUTGOING calls to downstream DB
+#
+# Analogy:
+# Section B = bouncer at the front door (stops too many guests)
+# This file = safety valve on pipes (stops pressure buildup
+#             when the drain is blocked)
+#
+# Downstream services protected:
+# 1. Aurora PostgreSQL (reconciliation database)
+# 2. DynamoDB (hot storage) via VPC endpoint
+# 3. ElastiCache Redis (cache layer)
+# =============================================================
+
+# ── Circuit Breaker for Aurora PostgreSQL ────────────────────
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: aurora-circuit-breaker
+  namespace: payments
+spec:
+  # Aurora writer endpoint
+  host: aurora-writer.payments.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        # Max concurrent connections to Aurora writer
+        # Aurora max_connections = ~5,000 for db.r6g.2xlarge
+        # We limit to 1,000 to leave headroom
+        maxConnections: 1000
+        connectTimeout: 3s
+
+        # Keep TCP connections alive
+        # Avoids expensive reconnection for every query
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+
+      http:
+        # Max concurrent HTTP requests to Aurora
+        http1MaxPendingRequests: 500
+        http2MaxRequests: 1000
+
+    # Circuit breaker via outlier detection
+    outlierDetection:
+      # How many consecutive 5xx errors before ejecting
+      # Aurora returning errors 3 times → eject from pool
+      consecutive5xxErrors: 3
+
+      # Scan for unhealthy hosts every 10 seconds
+      interval: 10s
+
+      # How long to eject Aurora from the connection pool
+      # Gives Aurora time to recover from overload
+      baseEjectionTime: 30s
+
+      # Never eject more than 50% of Aurora instances
+      # We have 1 writer + 2 readers = 3 instances
+      # Max eject = 1 instance at a time
+      maxEjectionPercent: 50
+
+      # Minimum healthy instances before ejection kicks in
+      minHealthPercent: 50
+
+---
+# ── Circuit Breaker for ElastiCache Redis ───────────────────
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: redis-circuit-breaker
+  namespace: payments
+spec:
+  host: redis.payments.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        # Redis can handle millions of connections
+        # But we limit per pod to avoid overwhelming single shard
+        maxConnections: 5000
+        connectTimeout: 1s  # Redis should respond very fast
+
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+
+    outlierDetection:
+      # Redis is very fast — if it errors 5x it is serious
+      consecutive5xxErrors: 5
+      interval: 5s
+      baseEjectionTime: 15s  # Shorter — Redis recovers fast
+      maxEjectionPercent: 33  # Never eject more than 1 of 3 shards
+      minHealthPercent: 66    # Keep at least 2 of 3 shards healthy
+
+---
+# ── VirtualService for Aurora with Retry Policy ─────────────
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: aurora-vs
+  namespace: payments
+spec:
+  hosts:
+    - aurora-writer.payments.svc.cluster.local
+  http:
+    - route:
+        - destination:
+            host: aurora-writer.payments.svc.cluster.local
+      # Retry failed Aurora calls automatically
+      retries:
+        # Try up to 3 times before giving up
+        attempts: 3
+        # Each attempt must respond within 2 seconds
+        perTryTimeout: 2s
+        # Only retry on these error types:
+        # - connect-failure: Aurora not reachable
+        # - retriable-4xx: temporary errors
+        retryOn: "connect-failure,retriable-4xx,503"
+      # Total timeout for all retries combined
+      timeout: 10s
+
+---
+# ── VirtualService for Redis with Retry Policy ──────────────
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: redis-vs
+  namespace: payments
+spec:
+  hosts:
+    - redis.payments.svc.cluster.local
+  http:
+    - route:
+        - destination:
+            host: redis.payments.svc.cluster.local
+      retries:
+        attempts: 2          # Only 2 retries — Redis should be fast
+        perTryTimeout: 500ms # Redis must respond within 500ms
+        retryOn: "connect-failure,503"
+      timeout: 2s            # Total 2 seconds max for Redis calls
