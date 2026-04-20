@@ -1,0 +1,115 @@
+# =============================================================
+# AlertManager Configuration
+# Purpose: Route alerts to the right team via the right channel
+#
+# Routing tree:
+# L1 = Critical → PagerDuty (wake up on-call engineer)
+# L2 = Warning  → Slack (notify team, no wake up)
+# L3 = Info     → Slack only (FYI)
+#
+# Inhibition rules:
+# If critical alert fires → suppress related warning alerts
+# Prevents alert storm where 1 issue creates 100 notifications
+# =============================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+stringData:
+  alertmanager.yaml: |
+    global:
+      # How long to wait before declaring alert resolved
+      resolve_timeout: 5m
+      pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+    # ── Routing Tree ─────────────────────────────────────────
+    route:
+      # Default receiver for all alerts
+      receiver: 'default-slack'
+
+      # Group alerts by these labels
+      # Alerts with same alertname+severity = one notification
+      group_by: ['alertname', 'severity', 'team']
+
+      # Wait 10s before sending first notification
+      # Allows related alerts to group together
+      group_wait: 10s
+
+      # Wait 1 min before sending new alerts in same group
+      group_interval: 1m
+
+      # Repeat alert every 4 hours if still firing
+      repeat_interval: 4h
+
+      routes:
+        # L1: Critical payment alerts → PagerDuty (page engineer)
+        - match:
+            severity: critical
+            team: payments
+          receiver: 'l1-pagerduty'
+          # Continue to next route after matching
+          # So critical alerts ALSO go to Slack
+          continue: true
+
+        # L2: Warning alerts → Slack only
+        - match:
+            severity: warning
+          receiver: 'l2-slack'
+
+        # TPS surge → special channel
+        - match:
+            alertname: TPSSurgeDetected
+          receiver: 'surge-slack'
+
+    # ── Inhibition Rules ──────────────────────────────────────
+    # Suppress warning if critical is already firing
+    # Same alertname + namespace = same issue
+    # Prevents: 1 outage → 50 warning alerts flooding Slack
+    inhibit_rules:
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: ['alertname', 'namespace']
+
+    # ── Receivers ─────────────────────────────────────────────
+    receivers:
+      # L1: PagerDuty — wakes up on-call engineer
+      - name: 'l1-pagerduty'
+        pagerduty_configs:
+          - routing_key: '${PAGERDUTY_KEY}'
+            severity: critical
+            description: >
+              {{ .GroupLabels.alertname }}:
+              {{ .CommonAnnotations.summary }}
+            details:
+              description: '{{ .CommonAnnotations.description }}'
+              runbook: 'https://wiki.tada.id/runbooks/payment'
+
+      # L2: Slack warning channel
+      - name: 'l2-slack'
+        slack_configs:
+          - api_url: '${SLACK_WEBHOOK_URL}'
+            channel: '#payments-alerts'
+            title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+            text: '{{ .CommonAnnotations.description }}'
+            color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+
+      # Surge channel: separate channel for TPS spike events
+      - name: 'surge-slack'
+        slack_configs:
+          - api_url: '${SLACK_WEBHOOK_URL}'
+            channel: '#payments-surge-event'
+            title: 'TPS SURGE DETECTED'
+            text: '{{ .CommonAnnotations.description }}'
+            color: 'danger'
+
+      # Default: catch-all Slack channel
+      - name: 'default-slack'
+        slack_configs:
+          - api_url: '${SLACK_WEBHOOK_URL}'
+            channel: '#payments-alerts'
+            title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+            text: '{{ .CommonAnnotations.description }}'
