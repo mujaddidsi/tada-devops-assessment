@@ -1,0 +1,137 @@
+# =============================================================
+# Chaos Experiment 1: Pod Kill at 500K TPS
+# Purpose: Validate system recovers within 30 seconds
+#          when 50% of payment pods are killed suddenly
+#
+# What we are testing:
+# - HPA detects missing pods and scales up quickly
+# - PDB prevents too many pods from being killed at once
+# - Zero transactions are lost during pod kill
+# - System recovers to baseline TPS within 30 seconds
+#
+# Steady-state hypothesis:
+# BEFORE chaos: p99 latency < 500ms, error rate < 0.1%
+# DURING chaos: error rate may spike briefly
+# AFTER chaos:  system recovers within 30 seconds
+#
+# Abort condition:
+# If error rate exceeds 5% for more than 10 seconds
+# → stop chaos immediately to prevent further damage
+# =============================================================
+
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: payment-pod-kill-chaos
+  namespace: payments
+spec:
+  engineState: active
+  appinfo:
+    appns: payments
+    applabel: app=payment-service
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+
+  experiments:
+    - name: pod-delete
+      spec:
+        # ── Probes ─────────────────────────────────────────
+        # Probes validate the system during chaos
+        probe:
+          # Probe 1: Validate zero transaction loss
+          - name: validate-zero-transaction-loss
+            type: cmdProbe
+            cmdProbe/inputs:
+              command: |
+                # Check DynamoDB for any DROPPED transactions
+                # If any transaction has status DROPPED = data loss
+                DROPPED=$(aws dynamodb scan \
+                  --table-name payment_events \
+                  --filter-expression "#s = :v" \
+                  --expression-attribute-names '{"#s":"status"}' \
+                  --expression-attribute-values '{":v":{"S":"DROPPED"}}' \
+                  --select COUNT \
+                  | jq '.Count')
+                echo "Dropped transactions: $DROPPED"
+                [ "$DROPPED" -eq 0 ] && echo "PASS" || echo "FAIL"
+              source: inline
+              comparator:
+                type: string
+                criteria: contains
+                value: "PASS"
+            runProperties:
+              probeTimeout: 30s
+              interval: 10s
+              attempt: 5
+            # Continuous: run probe throughout chaos duration
+            mode: Continuous
+
+          # Probe 2: Validate recovery time
+          - name: validate-recovery-within-30s
+            type: cmdProbe
+            cmdProbe/inputs:
+              command: |
+                # Check current TPS is above 80% of baseline
+                CURRENT_TPS=$(kubectl exec -n monitoring \
+                  deployment/prometheus -- \
+                  promtool query instant \
+                  'sum(transaction_rate:5m)' \
+                  | jq '.[0].value[1]' | tr -d '"')
+                BASELINE=500000
+                THRESHOLD=$(echo "$BASELINE * 0.8" | bc)
+                echo "Current TPS: $CURRENT_TPS"
+                (( $(echo "$CURRENT_TPS > $THRESHOLD" | bc) )) \
+                  && echo "PASS" || echo "FAIL"
+              source: inline
+              comparator:
+                type: string
+                criteria: contains
+                value: "PASS"
+            runProperties:
+              probeTimeout: 30s
+              interval: 5s
+              attempt: 6
+            # End of test: validate after chaos ends
+            mode: EOT
+
+        # ── Chaos Parameters ───────────────────────────────
+        components:
+          env:
+            # Run chaos for 60 seconds total
+            - name: TOTAL_CHAOS_DURATION
+              value: "60"
+            # Kill pods every 10 seconds
+            - name: CHAOS_INTERVAL
+              value: "10"
+            # Kill 50% of payment pods
+            - name: PODS_AFFECTED_PERC
+              value: "50"
+            # Graceful kill — respect terminationGracePeriod
+            - name: FORCE
+              value: "false"
+
+---
+# Steady State Hypothesis definition
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: payment-pod-kill-experiment
+  namespace: payments
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+      - apiGroups: [""]
+        resources: ["pods"]
+        verbs: ["get", "list", "delete", "watch"]
+    image: litmuschaos/go-runner:latest
+    args: ["-action=pod-delete"]
+    env:
+      - name: TARGET_CONTAINER
+        value: payment-service
+      # Abort if error rate exceeds 5%
+      - name: ABORT_ON_ERROR_RATE
+        value: "5"
+    labels:
+      name: pod-delete
+      app.kubernetes.io/part-of: litmus
