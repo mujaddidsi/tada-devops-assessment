@@ -1,0 +1,120 @@
+# =============================================================
+# Chaos Experiment 2: AZ Failure via Network Blackhole
+# Purpose: Validate system continues serving traffic when
+#          one entire Availability Zone becomes unreachable
+#
+# What we are testing:
+# - Karpenter reprovisions nodes in surviving AZs within 60s
+# - HPA scales pods in surviving AZs to compensate
+# - Route 53 health checks detect AZ failure
+# - No data loss during AZ failure
+# - System serves at least 66% capacity (2 of 3 AZs)
+#
+# Steady-state hypothesis:
+# BEFORE: all 3 AZs serving traffic normally
+# DURING: AZ-1a completely unreachable (100% packet loss)
+# AFTER:  traffic served from AZ-1b and AZ-1c only
+#         Karpenter provisions new nodes in surviving AZs
+#
+# Real-world scenario this simulates:
+# AWS AZ outage — happens occasionally in production
+# Our system must survive with zero manual intervention
+# =============================================================
+
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: az-failure-chaos
+  namespace: payments
+spec:
+  engineState: active
+  appinfo:
+    appns: payments
+    applabel: topology.kubernetes.io/zone=ap-southeast-1a
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+
+  experiments:
+    - name: node-network-loss
+      spec:
+        probe:
+          # Probe 1: Validate system still serves traffic
+          - name: validate-system-still-serving
+            type: httpProbe
+            httpProbe/inputs:
+              url: https://api.payment.tada.id/health
+              insecureSkipVerify: false
+              method:
+                get:
+                  criteria: "=="
+                  responseCode: "200"
+            runProperties:
+              probeTimeout: 10s
+              interval: 15s
+              attempt: 8      # Check every 15s for 2 minutes
+            mode: Continuous
+
+          # Probe 2: Validate Karpenter reprovisions within 60s
+          - name: validate-karpenter-reprovisioning
+            type: cmdProbe
+            cmdProbe/inputs:
+              command: |
+                # Count healthy nodes in surviving AZs
+                sleep 60
+                HEALTHY_NODES=$(kubectl get nodes \
+                  -l topology.kubernetes.io/zone!=ap-southeast-1a \
+                  --field-selector=status.conditions[?(@.type=='Ready')].status=True \
+                  --no-headers | wc -l)
+                echo "Healthy nodes in surviving AZs: $HEALTHY_NODES"
+                # Expect at least 10 nodes across AZ-1b and AZ-1c
+                [ "$HEALTHY_NODES" -ge 10 ] \
+                  && echo "PASS" || echo "FAIL"
+              source: inline
+              comparator:
+                type: string
+                criteria: contains
+                value: "PASS"
+            runProperties:
+              probeTimeout: 90s
+              attempt: 1
+            # Evaluate at end of test
+            mode: EOT
+
+          # Probe 3: Validate no data loss
+          - name: validate-no-data-loss
+            type: cmdProbe
+            cmdProbe/inputs:
+              command: |
+                # Check SQS DLQ for failed messages
+                DLQ_COUNT=$(aws sqs get-queue-attributes \
+                  --queue-url $DLQ_URL \
+                  --attribute-names ApproximateNumberOfMessages \
+                  | jq '.Attributes.ApproximateNumberOfMessages | tonumber')
+                echo "DLQ message count: $DLQ_COUNT"
+                # Allow max 10 failures during AZ outage
+                [ "$DLQ_COUNT" -lt 10 ] \
+                  && echo "PASS" || echo "FAIL"
+              source: inline
+              comparator:
+                type: string
+                criteria: contains
+                value: "PASS"
+            runProperties:
+              probeTimeout: 30s
+              attempt: 1
+            mode: EOT
+
+        components:
+          env:
+            # Run AZ blackhole for 120 seconds
+            - name: TOTAL_CHAOS_DURATION
+              value: "120"
+            # 100% packet loss = full AZ blackhole
+            - name: NETWORK_PACKET_LOSS_PERCENTAGE
+              value: "100"
+            # Target all nodes in AZ-1a
+            - name: TARGET_NODES_SELECTOR
+              value: "topology.kubernetes.io/zone=ap-southeast-1a"
+            # Add network latency to make it more realistic
+            - name: NETWORK_LATENCY
+              value: "1000"
