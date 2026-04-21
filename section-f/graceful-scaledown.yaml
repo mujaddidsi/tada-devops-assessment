@@ -1,0 +1,142 @@
+# =============================================================
+# Graceful Scale-Down Configuration
+# Purpose: Safely reduce capacity after spike without dropping
+#          in-flight payment transactions
+#
+# Three components work together:
+# 1. HPA scaleDown stabilization — wait before reducing pods
+# 2. Karpenter consolidation delay — wait before removing nodes
+# 3. Pod preStop hook — drain connections before pod dies
+#
+# Why graceful scale-down matters for payment:
+# During scale-down, pods receive SIGTERM signal
+# Without graceful handling:
+#   → Pod dies immediately
+#   → In-flight payment requests dropped
+#   → Users see errors and may retry (double charge risk!)
+#
+# With graceful handling:
+#   → Pod stops accepting new requests
+#   → Finishes all in-flight requests
+#   → Flushes pending SQS/Kinesis writes
+#   → Dies cleanly with zero transaction loss
+# =============================================================
+
+# ── HPA Scale-Down Configuration ────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-service-hpa
+  namespace: payments
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+  minReplicas: 10
+  maxReplicas: 5000
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "200"
+  behavior:
+    scaleUp:
+      # Scale up immediately — no delay
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 500
+          periodSeconds: 15
+    scaleDown:
+      # Wait 10 minutes before scaling down
+      # Reason: traffic may still be fluctuating after spike
+      # Prevents yo-yo scaling: down → up → down → up
+      stabilizationWindowSeconds: 600
+      selectPolicy: Min
+      policies:
+        # Remove at most 5% of pods every 2 minutes
+        # Very conservative — protects in-flight transactions
+        - type: Percent
+          value: 5
+          periodSeconds: 120
+
+---
+# ── Deployment with Graceful Shutdown ────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: payments
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      # Give pod 60 seconds to finish in-flight requests
+      # After 60s Kubernetes force-kills the pod
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: payment-service
+          image: payment-service:latest
+
+          lifecycle:
+            preStop:
+              exec:
+                # Step 1: Sleep 15 seconds
+                # Why? Kubernetes takes time to update Endpoints
+                # Without sleep, load balancer may still route
+                # new requests to this dying pod
+                # Sleep gives LB time to stop sending traffic
+                command: ["sh", "-c", "sleep 15"]
+
+          # Application must also handle SIGTERM gracefully:
+          # 1. Stop accepting new HTTP connections
+          # 2. Wait for in-flight requests to complete
+          # 3. Flush pending Kinesis/SQS writes
+          # 4. Close database connections cleanly
+          # 5. Exit with code 0
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+---
+# ── Karpenter Consolidation Policy ───────────────────────────
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: payment-burst-pool
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        name: payment-node-class
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["c6i", "c6a", "m6i"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+  disruption:
+    # Only consolidate when node is underutilized
+    consolidationPolicy: WhenUnderutilized
+    # Wait 30 minutes before consolidating
+    # Spike may still have aftershocks — do not consolidate too early
+    consolidateAfter: 30m
+    # Nodes expire after 30 days — force refresh for security patches
+    expireAfter: 720h
