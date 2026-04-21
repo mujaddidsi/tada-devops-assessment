@@ -1,0 +1,172 @@
+# =============================================================
+# Kubernetes NetworkPolicy
+# Purpose: Control which pods can communicate with each other
+#          Default: deny ALL traffic, then explicitly allow
+#
+# Why default deny?
+# Without NetworkPolicy: any pod can talk to any pod
+# If one pod is compromised → attacker can reach payment pods
+#
+# With default deny + explicit allow:
+# Only whitelisted communication paths are allowed
+# Compromised pod cannot reach payment pods ✅
+#
+# Policies defined:
+# 1. Default deny all ingress and egress
+# 2. Allow ingress from NGINX Ingress only
+# 3. Allow internal service-to-service communication
+# 4. Allow egress to AWS services via VPC endpoints
+# 5. Allow egress to DNS
+# =============================================================
+
+# ── Policy 1: Default Deny All ───────────────────────────────
+# Applied to ALL pods in payments namespace
+# Nothing can enter or leave by default
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: payments
+spec:
+  # Empty podSelector = applies to ALL pods in namespace
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress rules = deny all incoming traffic
+  # No egress rules = deny all outgoing traffic
+
+---
+# ── Policy 2: Allow Ingress from NGINX Only ──────────────────
+# Payment service can only receive traffic from NGINX Ingress
+# Direct access from other pods is blocked
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-nginx
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Only allow from ingress-nginx namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          # Only allow from NGINX Ingress pods specifically
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+
+---
+# ── Policy 3: Allow Internal Service Communication ───────────
+# payment-service can send to payment-consumer
+# payment-consumer can receive from payment-service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-payment-internal
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-consumer
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Only payment-service can send to payment-consumer
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - port: 8080
+          protocol: TCP
+
+---
+# ── Policy 4: Allow Egress to AWS Services ───────────────────
+# Pods need to reach: DynamoDB, Kinesis, SQS, S3
+# All via VPC endpoints (private, no internet)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-aws-services
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-service
+  policyTypes:
+    - Egress
+  egress:
+    # Allow to VPC CIDR (covers all VPC endpoints)
+    - to:
+        - ipBlock:
+            # VPC CIDR — covers DynamoDB, Kinesis, SQS endpoints
+            cidr: 10.0.0.0/8
+      ports:
+        - port: 443
+          protocol: TCP
+
+---
+# ── Policy 5: Allow Egress to DNS ────────────────────────────
+# All pods need DNS resolution to find other services
+# Without this, pods cannot resolve service names
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: payments
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # kube-dns runs in kube-system namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        # DNS port
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# ── Policy 6: Allow Egress to Monitoring ─────────────────────
+# Pods need to send metrics to Prometheus
+# and traces to OTel Collector
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-monitoring
+  namespace: payments
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Allow to monitoring namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        # Prometheus metrics
+        - port: 9090
+          protocol: TCP
+        # OTel Collector gRPC
+        - port: 4317
+          protocol: TCP
+        # OTel Collector HTTP
+        - port: 4318
+          protocol: TCP
